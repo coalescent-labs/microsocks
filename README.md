@@ -49,6 +49,28 @@ prefix: do so in config.mak:
     printf 'CC=i686-musl-linux-gcc\nprefix=/usr\n' > config.mak
     make
 
+low latency relay
+-----------------
+
+this fork forwards every chunk as soon as it arrives, which matters for
+request/response protocols with many small messages (e.g. trading):
+
+- TCP_NODELAY on both sockets: Nagle's algorithm would otherwise hold back
+  a small message until the previous one is ACKed by the peer.
+- non-blocking relay with one buffer per direction: a peer that is slow to
+  read stalls only its own direction. the upstream loop could deadlock with
+  sustained traffic in both directions.
+- data coming back from the target is served first.
+
+building for RHEL 8 (the binary also runs on RHEL 9 and 10):
+
+    docker build -o out .        # or podman; binary in out/microsocks
+
+tests (private network namespace, no root needed; python3, iproute-tc):
+
+    tests/run.sh ./microsocks                      # functional + resource regression
+    bench/run.sh /path/to/old/microsocks ./microsocks   # latency comparison
+
 command line options
 --------------------
 
