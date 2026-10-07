@@ -30,7 +30,10 @@
 #include <pthread.h>
 #include <signal.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <errno.h>
 #include <limits.h>
 #include "server.h"
@@ -116,6 +119,13 @@ struct thread {
 static void dolog(const char* fmt, ...) { }
 #endif
 
+/* disable nagle's algorithm: forward every chunk immediately instead of
+   holding small segments back until the previous ones got ACKed. */
+static void set_nodelay(int fd) {
+	int yes = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes);
+}
+
 static struct addrinfo* addr_choose(struct addrinfo* list, union sockaddr_union* bindaddr) {
 	int af = SOCKADDR_UNION_AF(bindaddr);
 	if(af == AF_UNSPEC) return list;
@@ -193,6 +203,7 @@ static int connect_socks_target(unsigned char *buf, size_t n, struct client *cli
 		goto eval_errno;
 
 	freeaddrinfo(remote);
+	set_nodelay(fd);
 	if(CONFIG_LOG) {
 		char clientname[256];
 		af = SOCKADDR_UNION_AF(&client->addr);
@@ -266,13 +277,78 @@ static void send_error(int fd, enum errorcode ec) {
 	write(fd, buf, 10);
 }
 
+/* since the biggest stack consumer in the entire code is
+   libc's getaddrinfo(), we can safely use at least half the
+   available stacksize for the two relay buffers. */
+#define RELAY_BUFSIZE MIN(8*1024, THREAD_STACK_SIZE/4)
+
+struct relay {
+	int in, out; /* indexes into the pollfd array */
+	ssize_t len, off;
+	char buf[RELAY_BUFSIZE];
+};
+
+static int is_retry(void) {
+	return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+}
+
+static void set_nonblock(int fd, int on) {
+	int fl = fcntl(fd, F_GETFL);
+	if(fl != -1) fcntl(fd, F_SETFL, on ? fl | O_NONBLOCK : fl & ~O_NONBLOCK);
+}
+
+/* write as much of the pending data as possible without blocking.
+   returns -1 on error. */
+static int relay_flush(struct relay *r, struct pollfd *fds) {
+	while(r->off < r->len) {
+		ssize_t m = write(fds[r->out].fd, r->buf + r->off, r->len - r->off);
+		if(m < 0) {
+			if(errno == EINTR) continue;
+			if(errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+			return -1;
+		}
+		r->off += m;
+	}
+	r->len = r->off = 0;
+	return 0;
+}
+
+/* deliver what is still buffered before closing, like the blocking
+   implementation did, e.g. the last message before a logout. */
+static void relay_drain(struct relay *dir, struct pollfd *fds) {
+	int i;
+	for(i = 0; i < 2; i++) {
+		if(!dir[i].len) continue;
+		set_nonblock(fds[dir[i].out].fd, 0);
+		relay_flush(&dir[i], fds);
+	}
+}
+
 static void copyloop(int fd1, int fd2) {
 	struct pollfd fds[2] = {
-		[0] = {.fd = fd1, .events = POLLIN},
-		[1] = {.fd = fd2, .events = POLLIN},
+		[0] = {.fd = fd1},
+		[1] = {.fd = fd2},
 	};
+	/* one buffer per direction on non-blocking sockets: a peer that is
+	   slow to read stalls only its own direction, never the other one.
+	   dir[0] (remote -> client) comes first, so that responses are served
+	   before new requests in the same iteration. */
+	struct relay dir[2]; /* no initializer: it would memset the buffers */
+	int i;
+	for(i = 0; i < 2; i++) {
+		dir[i].in = !i;
+		dir[i].out = i;
+		dir[i].len = dir[i].off = 0;
+	}
+	set_nonblock(fd1, 1);
+	set_nonblock(fd2, 1);
 
 	while(1) {
+		fds[0].events = fds[1].events = 0;
+		for(i = 0; i < 2; i++) {
+			if(dir[i].len) fds[dir[i].out].events |= POLLOUT;
+			else fds[dir[i].in].events |= POLLIN;
+		}
 		switch(poll(fds, 2, timeout ? timeout*1000 : -1)) {
 			case 0:
 				return;
@@ -281,18 +357,32 @@ static void copyloop(int fd1, int fd2) {
 				else perror("poll");
 				return;
 		}
-		int infd = (fds[0].revents & POLLIN) ? fd1 : fd2;
-		int outfd = infd == fd2 ? fd1 : fd2;
-		/* since the biggest stack consumer in the entire code is
-		   libc's getaddrinfo(), we can safely use at least half the
-		   available stacksize to improve throughput. */
-		char buf[MIN(16*1024, THREAD_STACK_SIZE/2)];
-		ssize_t sent = 0, n = read(infd, buf, sizeof buf);
-		if(n <= 0) return;
-		while(sent < n) {
-			ssize_t m = write(outfd, buf+sent, n-sent);
-			if(m < 0) return;
-			sent += m;
+		/* error/hangup on a socket nobody is waiting on (its direction
+		   still has data pending): nothing below would consume it and
+		   poll() would keep returning at once. deliver the pending data,
+		   as the blocking implementation did, and close. */
+		for(i = 0; i < 2; i++) {
+			if(!fds[i].events && fds[i].revents) {
+				relay_drain(dir, fds);
+				return;
+			}
+		}
+		for(i = 0; i < 2; i++) {
+			struct relay *r = &dir[i];
+			if(!r->len) {
+				if(!(fds[r->in].revents & (POLLIN|POLLHUP|POLLERR))) continue;
+				ssize_t n = read(fds[r->in].fd, r->buf, sizeof r->buf);
+				if(n < 0 && is_retry()) continue;
+				if(n <= 0) {
+					relay_drain(dir, fds);
+					return;
+				}
+				r->len = n;
+			} else if(!(fds[r->out].revents & (POLLOUT|POLLHUP|POLLERR)))
+				continue;
+			/* forward right away, poll() is only needed if the peer is
+			   not keeping up. */
+			if(relay_flush(r, fds)) return;
 		}
 	}
 }
@@ -356,6 +446,7 @@ static int handshake(struct thread *t) {
 
 static void* clientthread(void *data) {
 	struct thread *t = data;
+	set_nodelay(t->client.fd);
 	int remotefd = handshake(t);
 	if(remotefd != -1) {
 		copyloop(t->client.fd, remotefd);
